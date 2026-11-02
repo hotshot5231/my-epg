@@ -1,6 +1,6 @@
-
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import re
 import tempfile
@@ -22,15 +22,75 @@ FEEDS = {
     "epgpw": "https://epg.pw/xmltv/epg_US.xml",
 }
 
-# Manual overrides: playlist tvg-id -> (feed, source channel id).
+GUIDES_URL = "https://iptv-org.github.io/api/guides.json"
+# iptv-org guides.json lists which i.mjh.nz feed/id each tvg-id uses.
+MJH_PREFIX = {
+    "PlutoTV/us#": "pluto",
+    "Plex/us#": "plex",
+    "SamsungTVPlus/us#": "samsung",
+    "Roku/all#": "roku",
+}
+
+# Manual overrides: playlist tvg-id -> (feed, source channel id[, shift_hours]).
+# shift_hours moves the listings later (for West Coast copies of an East feed).
+_ESPN = ("epgpw", "465198")
+_ABC_E = ("epgpw", "464902")
+_NBC_E = ("epgpw", "465059")
+_NBC_W = ("epgpw", "465252")
+_PBS = ("epgpw", "465245")
+_PBSK_E = ("epgpw", "464925")
+_PBSK_W = ("epgpw", "565870")
+_TEL_E = ("epgpw", "464962")
+_TEL_W = ("epgpw", "465086")
+_UNI_W = ("epgpw", "465341")
+_UNIMAS_C = ("epgpw", "464928")
+_UNIMAS_W = ("epgpw", "464918")
+_FOX_E = ("epgpw", "549207")  # a real Fox affiliate (WCTI New Bern), Eastern time
+
 OVERRIDES = {
-    "ESPN.us@HD": ("epgpw", "465198"),
-    "ESPN.us@SD": ("epgpw", "465198"),
+    "ESPN.us@HD": _ESPN,
+    "ESPN.us@SD": _ESPN,
     "HallmarkMoviesMore.us@SD": (
         "plex",
         "6a1610bebdf296985fd95603-6244cf3c742b0d58cd4f2514",
     ),
+    # ABC / CBS / NBC
+    "ABC.us@WFTV": _ABC_E,
+    "ABC.us@WSOCTV": _ABC_E,
+    "CBS.us@KIROTV": ("epgpw", "464830"),
+    "NBC.us@East": _NBC_E,
+    "NBC.us@WGAL": _NBC_E,
+    "NBC.us@WJACTV": _NBC_E,
+    "NBC.us@WNYT": _NBC_E,
+    "NBC.us@West": _NBC_W,
+    # Fox (East feed; West Coast copies shifted +3h)
+    "Fox.us@WTXFTV": _FOX_E,
+    "Fox.us@KCPQ": _FOX_E + (3,),
+    "Fox.us@KMPHTV": _FOX_E + (3,),
+    "Fox.us@West": _FOX_E + (3,),
+    "FoxSports1.us@HD": ("epgpw", "465291"),
+    "FoxSports2.us@HD": ("epgpw", "465355"),
+    # PBS
+    "PBS.us@East": _PBS,
+    "PBS.us@WEDQ": _PBS,
+    "PBSKidsEasternCentral.us@SD": _PBSK_E,
+    "PBSKidsAlaska.us@SD": _PBSK_W,
+    "PBSKidsHawaii.us@SD": _PBSK_W,
+    "PBSKidsMountain.us@SD": _PBSK_W,
+    "PBSKidsPacific.us@SD": _PBSK_W,
+    # Spanish-language networks
+    "Telemundo.us@East": _TEL_E,
+    "Telemundo.us@EastHD": _TEL_E,
+    "TelemundoCorpusChristi.us@SD": _TEL_E,
+    "Telemundo.us@West": _TEL_W,
+    "Univision.us@West": _UNI_W,
+    "UniMas.us@Central": _UNIMAS_C,
+    "UniMas.us@KUVNDT": _UNIMAS_C,
+    "UniMas.us@Mountain": _UNIMAS_W,
 }
+# ABC News Live 1-10 all share one guide.
+for _n in range(1, 11):
+    OVERRIDES[f"ABCNewsLive{_n}.us@SD"] = ("epgpw", "465150")
 
 
 def download(url, path):
@@ -71,8 +131,31 @@ NETWORKS = r"(?:ABC|NBC|CBS|FOX|Fox|PBS|CW|The CW|MyNetworkTV|Telemundo|Univisio
 
 def call_sign(name):
     """Local-station call sign (e.g. KGTV) from names like 'ABC KGTV (720p)'."""
-    m = re.match(r"^" + NETWORKS + r"\s+([KW][A-Z]{2,3})(?:-(?:TV|DT|LD|CD))?\b", name)
+    m = re.match(
+        r"^" + NETWORKS + r"(?:\s+\(United States\))?\s+([KW][A-Z]{2,3})(?:-(?:TV|DT|LD|CD))?\b",
+        name,
+    )
     return m.group(1) if m else None
+
+
+def read_guides_map():
+    """tvg-id base (e.g. 'ESPN.us') -> list of (feed, source id) from iptv-org's guides.json."""
+    try:
+        request = urllib.request.Request(GUIDES_URL, headers={"User-Agent": "Mozilla/5.0 EPG builder"})
+        data = json.load(urllib.request.urlopen(request, timeout=120))
+    except Exception as error:
+        print(f"guides.json unavailable: {error}", flush=True)
+        return {}
+    result = {}
+    for item in data:
+        if item.get("site") != "i.mjh.nz":
+            continue
+        for prefix, feed in MJH_PREFIX.items():
+            if item.get("site_id", "").startswith(prefix):
+                result.setdefault(item["channel"], []).append(
+                    (feed, item["site_id"][len(prefix):])
+                )
+    return result
 
 
 def read_playlist():
@@ -160,9 +243,11 @@ def main():
     # Local stations in epg.pw are listed by call sign, e.g. "KGTV-DT".
     call_index = {}
     for source_id, display in names.get("epgpw", {}).items():
-        m = re.match(r"^([KW][A-Z]{2,3})-DT$", display.strip())
+        m = re.match(r"^([KW][A-Z]{2,3})-(?:DT|CD|LD)$", display.strip())
         if m:
             call_index.setdefault(m.group(1), []).append(source_id)
+
+    guides_map = read_guides_map()
 
     # Decide a (feed, source id) for every playlist channel.
     mapping = {}  # tvg-id -> (feed, source id, display name)
@@ -182,13 +267,19 @@ def main():
             sign = call_sign(name)
             if sign and len(call_index.get(sign, [])) == 1:
                 match = ("epgpw", call_index[sign][0])
+        if not match:
+            for feed, source_id in guides_map.get(tvg_id.split("@")[0], []):
+                if source_id in names.get(feed, {}):
+                    match = (feed, source_id)
+                    break
         if match and match[0] in paths:
-            mapping[tvg_id] = (match[0], match[1], name.strip())
+            shift = match[2] if len(match) > 2 else 0
+            mapping[tvg_id] = (match[0], match[1], name.strip(), shift)
 
     # Pull programmes feed by feed.
     programmes = {}
     for key in paths:
-        wanted = {src for feed, src, _ in mapping.values() if feed == key}
+        wanted = {m[1] for m in mapping.values() if m[0] == key}
         if wanted:
             programmes[key] = read_programmes(paths[key], wanted)
 
@@ -196,7 +287,7 @@ def main():
     tv = ET.Element("tv", {"generator-info-name": "Custom mapped EPG"})
     all_programmes = []
     kept = 0
-    for tvg_id, (feed, source_id, display) in mapping.items():
+    for tvg_id, (feed, source_id, display, shift) in mapping.items():
         items = programmes.get(feed, {}).get(source_id, [])
         live = [
             p for p in items
@@ -209,6 +300,11 @@ def main():
         for p in live:
             copy = deepcopy(p)
             copy.set("channel", tvg_id)
+            if shift:
+                for attr in ("start", "stop"):
+                    moved = parse_time(copy.get(attr, ""))
+                    if moved:
+                        copy.set(attr, (moved + timedelta(hours=shift)).strftime("%Y%m%d%H%M%S %z"))
             all_programmes.append(copy)
         kept += 1
 
