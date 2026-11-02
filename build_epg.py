@@ -1,8 +1,10 @@
+
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import re
 import tempfile
+import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -46,6 +48,31 @@ def normalize(name):
     name = re.sub(r"\(.*?\)", " ", name)
     name = re.sub(r"\bhd\b", " ", name)
     return re.sub(r"[^a-z0-9]", "", name)
+
+
+def normalize_loose(name):
+    """Looser match: fold accents, drop trailing noise words like HD/TV/Network."""
+    name = "".join(
+        c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c)
+    ).lower()
+    name = re.sub(r"\(.*?\)", " ", name).replace("&", " and ")
+    name = name.strip()
+    noise = r"(hd|sd|us|usa|tv|east|west|network|channel)"
+    while True:
+        new = re.sub(r"\s+" + noise + r"$", "", name)
+        if new == name:
+            break
+        name = new
+    return re.sub(r"[^a-z0-9]", "", name)
+
+
+NETWORKS = r"(?:ABC|NBC|CBS|FOX|Fox|PBS|CW|The CW|MyNetworkTV|Telemundo|Univision|UniMas|Ion|ION)"
+
+
+def call_sign(name):
+    """Local-station call sign (e.g. KGTV) from names like 'ABC KGTV (720p)'."""
+    m = re.match(r"^" + NETWORKS + r"\s+([KW][A-Z]{2,3})(?:-(?:TV|DT|LD|CD))?\b", name)
+    return m.group(1) if m else None
 
 
 def read_playlist():
@@ -125,6 +152,18 @@ def main():
         for source_id, display in names.get(key, {}).items():
             name_index.setdefault(normalize(display), (key, source_id))
 
+    loose_index = {}
+    for key in FEEDS:
+        for source_id, display in names.get(key, {}).items():
+            loose_index.setdefault(normalize_loose(display), (key, source_id))
+
+    # Local stations in epg.pw are listed by call sign, e.g. "KGTV-DT".
+    call_index = {}
+    for source_id, display in names.get("epgpw", {}).items():
+        m = re.match(r"^([KW][A-Z]{2,3})-DT$", display.strip())
+        if m:
+            call_index.setdefault(m.group(1), []).append(source_id)
+
     # Decide a (feed, source id) for every playlist channel.
     mapping = {}  # tvg-id -> (feed, source id, display name)
     for tvg_id, name, url in playlist:
@@ -137,6 +176,12 @@ def main():
                 match = ("pluto", pluto.group(1))
         if not match:
             match = name_index.get(normalize(name))
+        if not match:
+            match = loose_index.get(normalize_loose(name))
+        if not match and "epgpw" in paths:
+            sign = call_sign(name)
+            if sign and len(call_index.get(sign, [])) == 1:
+                match = ("epgpw", call_index[sign][0])
         if match and match[0] in paths:
             mapping[tvg_id] = (match[0], match[1], name.strip())
 
