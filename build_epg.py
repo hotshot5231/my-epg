@@ -419,6 +419,40 @@ def main():
             all_programmes.append(copy)
         kept += 1
 
+# Diagnostic only: report missing guide coverage without changing mappings.
+    published_ids = {ch.get("id") for ch in tv.findall("channel")}
+    missing_ids = set(pl_names) - published_ids
+    unmapped_ids = missing_ids - set(mapping)
+    empty_ids = missing_ids & set(mapping)
+
+    print("\n=== MISSING GUIDE COVERAGE START ===", flush=True)
+    print(
+        f"Unique playlist IDs: {len(pl_names)}; "
+        f"with listings: {len(published_ids)}; "
+        f"missing listings: {len(missing_ids)}",
+        flush=True,
+    )
+
+    print(f"\nNO SOURCE MATCH ({len(unmapped_ids)}):", flush=True)
+    for tvg_id in sorted(unmapped_ids):
+        print(
+            f"  {tvg_id} | {pl_names[tvg_id].strip()!r}",
+            flush=True,
+        )
+
+    print(f"\nMATCHED BUT NO CURRENT LISTINGS ({len(empty_ids)}):", flush=True)
+    for tvg_id in sorted(empty_ids):
+        feed, source_id, display, shift = mapping[tvg_id]
+        source_name = names.get(feed, {}).get(source_id, "")
+        print(
+            f"  {tvg_id} | {display!r} | "
+            f"source={feed}:{source_id} | source_name={source_name!r} | "
+            f"shift_hours={shift}",
+            flush=True,
+        )
+
+    print("=== MISSING GUIDE COVERAGE END ===\n", flush=True)
+    
     if kept < MIN_CHANNELS:
         raise RuntimeError(
             f"Only {kept} channels have current listings (minimum {MIN_CHANNELS}). Not publishing."
