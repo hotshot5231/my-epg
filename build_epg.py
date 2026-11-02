@@ -96,6 +96,54 @@ OVERRIDES = {
 for _n in range(1, 11):
     OVERRIDES[f"ABCNewsLive{_n}.us@SD"] = ("epgpw", "465150")
 
+# Cable channels matched by name in epg.pw
+OVERRIDES.update({
+    "MTV.us@East": ("epgpw", "465080"),
+    "MTV2.us@East": ("epgpw", "465113"),
+    "CNBC.us@SD": ("epgpw", "464791"),
+    "EWTN.us@English": ("epgpw", "465352"),
+    "E.us@East": ("epgpw", "464832"),
+    "TCM.us@East": ("epgpw", "465196"),
+    "HGTV.us@East": ("epgpw", "465028"),
+    "GameShowNetwork.us@East": ("epgpw", "464810"),
+    "InvestigationDiscovery.us@East": ("epgpw", "465294"),
+    "DiscoveryChannel.us@East": ("epgpw", "465364"),
+    "LifetimeMovies.us@East": ("epgpw", "464929"),
+    "CartoonNetwork.us@East": ("epgpw", "465267"),
+    "OWN.us@East": ("epgpw", "465259"),
+    "StarzKidsFamily.us@East": ("epgpw", "465109"),
+    "TNT.us@East": ("epgpw", "465114"),
+    "TNT.us@West": ("epgpw", "465307"),
+    "TBS.us@East": ("epgpw", "465285"),
+    "TBS.us@West": ("epgpw", "465131"),
+    "truTV.us@West": ("epgpw", "464988"),
+    "Galavision.us@West": ("epgpw", "465312"),
+    "News12NewJersey.us@SD": ("epgpw", "524797"),
+    "News12Bronx.us@SD": ("epgpw", "578055"),
+    "News12HudsonValley.us@SD": ("epgpw", "578056"),
+    "News12Westchester.us@SD": ("epgpw", "578058"),
+    "News12Conneticut.us@SD": ("epgpw", "578059"),
+    "News12Brooklyn.us@SD": ("epgpw", "578063"),
+    "News12LongIsland.us@SD": ("epgpw", "578068"),
+    "WPLG101.us@HD": ("epgpw", "466285"),
+    "KNXVTV611.us@HD": ("epgpw", "468352"),
+    "KIIOLD101.us@HD": ("epgpw", "466398"),
+    "DaystarTV.us@SD": ("epgpw", "464906"),
+    "TVEInternacionalAmerica.es@SD": ("epgpw", "464986"),
+    "AWE.us@SD": ("epgpw", "465071"),
+    "Reelz.us@SD": ("epgpw", "465018"),
+    "HopeChannelNorthAmerica.us@SD": ("epgpw", "464958"),
+    "WorldHarvestTV.us@SD": ("epgpw", "465179"),
+    "JewishLifeTelevision.us@SD": ("epgpw", "464860"),
+    "CatholicFaithNetwork.us@SD": ("epgpw", "464982"),
+    "SonyMovies.us@SD": ("epgpw", "464943"),
+    "CineSony.us@SD": ("epgpw", "464793"),
+    "MLBStrikeZone.us@SD": ("epgpw", "464844"),
+    "VSiN.us@SD": ("epgpw", "465295"),
+    "3ABNEnglish.us@SD": ("epgpw", "465145"),
+    "Willow.us@SD": ("epgpw", "465010"),
+})
+
 
 def download(url, path):
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 EPG builder"})
@@ -251,8 +299,15 @@ def run_scraper(unmatched_ids, tmp):
         except Exception as error:
             print(f"  scrape failed for {site}: {error}", flush=True)
         if out.exists():
-            results[site] = (out, ids)
-            remaining -= set(ids)
+            try:
+                got = {p.get("channel") for p in ET.parse(out).getroot().iter("programme")}
+            except Exception as error:
+                print(f"  could not read {site} output: {error}", flush=True)
+                got = set()
+            print(f"  {site}: {len(got)} channels returned listings", flush=True)
+            if got:
+                results[site] = (out, [i for i in ids if i in got])
+            remaining -= got
     return results
 
 
