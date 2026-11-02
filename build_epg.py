@@ -1,5 +1,6 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import difflib
 import json
 from pathlib import Path
 import re
@@ -157,7 +158,7 @@ def download(url, path):
 
 def normalize(name):
     name = name.lower()
-    name = re.sub(r"\(.*?\)", " ", name)
+    name = re.sub(r"\(.*?\)|\[.*?\]", " ", name)
     name = re.sub(r"\bhd\b", " ", name)
     return re.sub(r"[^a-z0-9]", "", name)
 
@@ -167,7 +168,7 @@ def normalize_loose(name):
     name = "".join(
         c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c)
     ).lower()
-    name = re.sub(r"\(.*?\)", " ", name).replace("&", " and ")
+    name = re.sub(r"\(.*?\)|\[.*?\]", " ", name).replace("&", " and ")
     name = name.strip()
     noise = r"(hd|sd|us|usa|tv|east|west|network|channel)"
     while True:
@@ -311,6 +312,34 @@ def run_scraper(unmatched_ids, tmp):
     return results
 
 
+def print_closest_names(unmapped_ids, pl_names, names):
+    """Debug only: for each unmatched playlist channel, list similar guide channel names."""
+    print("\n=== CLOSEST GUIDE NAMES START ===", flush=True)
+    keyed = {}  # loose key -> list of (feed, source id, display name)
+    for feed in FEEDS:
+        for source_id, display in names.get(feed, {}).items():
+            key = normalize_loose(display)
+            if len(key) >= 3:
+                keyed.setdefault(key, []).append((feed, source_id, display))
+    keys = list(keyed)
+    shown = 0
+    for tvg_id in sorted(unmapped_ids):
+        name = pl_names[tvg_id].strip()
+        target = normalize_loose(name)
+        if len(target) < 3:
+            continue
+        close = difflib.get_close_matches(target, keys, n=3, cutoff=0.75)
+        if not close:
+            continue
+        shown += 1
+        print(f"  {tvg_id} | {name!r}", flush=True)
+        for key in close:
+            for feed, source_id, display in keyed[key][:2]:
+                print(f"      -> {feed}:{source_id} | {display!r}", flush=True)
+    print(f"({shown} unmatched channels have close names)", flush=True)
+    print("=== CLOSEST GUIDE NAMES END ===\n", flush=True)
+
+
 def main():
     playlist = read_playlist()
     print(f"Playlist channels: {len(playlist)}", flush=True)
@@ -361,6 +390,9 @@ def main():
             match = name_index.get(normalize(name))
         if not match:
             match = loose_index.get(normalize_loose(name))
+        if not match and name.lower().startswith("pluto tv "):
+            rest = name[9:]
+            match = name_index.get(normalize(rest)) or loose_index.get(normalize_loose(rest))
         if not match and "epgpw" in paths:
             sign = call_sign(name)
             if sign and len(call_index.get(sign, [])) == 1:
@@ -419,7 +451,7 @@ def main():
             all_programmes.append(copy)
         kept += 1
 
-# Diagnostic only: report missing guide coverage without changing mappings.
+    # Diagnostic only: report missing guide coverage without changing mappings.
     published_ids = {ch.get("id") for ch in tv.findall("channel")}
     missing_ids = set(pl_names) - published_ids
     unmapped_ids = missing_ids - set(mapping)
@@ -435,10 +467,7 @@ def main():
 
     print(f"\nNO SOURCE MATCH ({len(unmapped_ids)}):", flush=True)
     for tvg_id in sorted(unmapped_ids):
-        print(
-            f"  {tvg_id} | {pl_names[tvg_id].strip()!r}",
-            flush=True,
-        )
+        print(f"  {tvg_id} | {pl_names[tvg_id].strip()!r}", flush=True)
 
     print(f"\nMATCHED BUT NO CURRENT LISTINGS ({len(empty_ids)}):", flush=True)
     for tvg_id in sorted(empty_ids):
@@ -450,9 +479,13 @@ def main():
             f"shift_hours={shift}",
             flush=True,
         )
-
     print("=== MISSING GUIDE COVERAGE END ===\n", flush=True)
-    
+
+    try:
+        print_closest_names(unmapped_ids, pl_names, names)
+    except Exception as error:
+        print(f"Closest-name debug skipped: {error}", flush=True)
+
     if kept < MIN_CHANNELS:
         raise RuntimeError(
             f"Only {kept} channels have current listings (minimum {MIN_CHANNELS}). Not publishing."
