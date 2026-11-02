@@ -50,6 +50,21 @@ FALLBACK_FEEDS = {
     ),
 }
 
+# Trailing provider labels used in EPGTalk display names.
+# Value = provider id (used to honor a provider hint), or None for
+# labels that are just noise (e.g. "(FAST)").
+PROVIDER_LABELS = {
+    "plex": "plex",
+    "samsung tv plus": "samsung",
+    "pluto tv": "pluto",
+    "pluto": "pluto",
+    "roku channel": "roku",
+    "the roku channel": "roku",
+    "roku": "roku",
+    "tubi": "tubi",
+    "fast": None,
+}
+
 GUIDES_URL = "https://iptv-org.github.io/api/guides.json"
 
 MJH_PREFIX = {
@@ -123,7 +138,7 @@ OVERRIDES = {
     "UniMas.us@KUVNDT": _UNIMAS_C,
     "UniMas.us@Mountain": _UNIMAS_W,
 
-    # Bundled Starz correction
+    # Starz correction
     "StarzEncoreSpanish.us@East": ("epgpw", "465119"),
 }
 
@@ -261,22 +276,64 @@ def normalize_loose(name):
     return re.sub(r"[^a-z0-9]", "", name)
 
 
+def split_provider(display):
+    """Strip trailing provider labels like '(Plex)' or '(Samsung TV Plus)'.
+
+    Returns (name_without_provider_labels, provider_or_None).
+    Regional/language labels are left alone.
+    """
+    text = (display or "").strip()
+    provider = None
+
+    while True:
+        match = re.search(r"\s*\(([^()]*)\)\s*$", text)
+        if not match:
+            break
+        label = match.group(1).strip().lower()
+        if label not in PROVIDER_LABELS:
+            break
+        if provider is None:
+            provider = PROVIDER_LABELS[label]
+        text = text[:match.start()]
+
+    return text.strip(), provider
+
+
 def fallback_name_key(name):
-    """Conservative fallback matching; retain regions and network words."""
+    """Conservative fallback key: provider labels, resolution markers and
+    bracketed tags are removed; regions and language words are retained."""
+    name, _ = split_provider(name)
+
     name = "".join(
         c for c in unicodedata.normalize("NFKD", name)
         if not unicodedata.combining(c)
     ).lower()
 
-    # Remove resolution markers, not arbitrary parenthetical content.
+    # Resolution markers like (720p) / (HD)
     name = re.sub(
         r"[\(\[]\s*(?:\d{3,4}[pi]|hd|sd|fhd|uhd|4k|8k)\s*[\)\]]",
         " ",
         name,
     )
+    # Bracketed status tags like [Not 24/7] / [Geo-blocked]
+    name = re.sub(r"\[[^\]]*\]", " ", name)
     name = re.sub(r"\b(?:hd|sd|fhd|uhd|4k|8k)\b", " ", name)
     name = name.replace("&", " and ").replace("+", " plus ")
     return re.sub(r"[^a-z0-9]", "", name)
+
+
+def stream_provider(url):
+    """Provider hint taken from the playlist stream URL, if any."""
+    text = (url or "").lower()
+    if "plu-" in text or "pluto" in text:
+        return "pluto"
+    if "plex" in text:
+        return "plex"
+    if "samsung" in text:
+        return "samsung"
+    if "roku" in text:
+        return "roku"
+    return None
 
 
 NETWORKS = (
@@ -442,6 +499,15 @@ def covered_ids(mapping, programmes, now):
     }
 
 
+def schedule_signature(items, limit=10):
+    """Compact fingerprint of a schedule, for comparing candidates."""
+    ordered = sorted(items, key=lambda p: p.get("start", ""))[:limit]
+    return tuple(
+        (p.get("start", ""), (p.findtext("title") or "").strip().lower())
+        for p in ordered
+    )
+
+
 def run_scraper(unmatched_ids, tmp):
     base = Path("epg-scraper").resolve()
     results = {}
@@ -517,7 +583,7 @@ def run_scraper(unmatched_ids, tmp):
 
 
 def recover_from_fallbacks(
-    pl_names, mapping, programmes, names, tmp, now
+    pl_names, pl_urls, mapping, programmes, names, tmp, now
 ):
     """Fill only coverage gaps; never replace a working existing match."""
     baseline = covered_ids(mapping, programmes, now)
@@ -527,7 +593,9 @@ def recover_from_fallbacks(
     for feed, url in FALLBACK_FEEDS.items():
         report = {
             "status": "not needed",
-            "candidates": 0,
+            "name_candidates": 0,
+            "ambiguous": [],
+            "no_listings": [],
             "recovered": [],
         }
         reports[feed] = report
@@ -547,35 +615,37 @@ def recover_from_fallbacks(
                 for source_id, displays in records.items()
             }
 
-            # Map each normalized display-name to ALL matching source IDs.
-            # Ambiguous names are not selected automatically.
+            # normalized name -> ALL matching source ids, plus the
+            # provider each source id belongs to (from its label).
             name_index = {}
+            providers = {}
             for source_id, displays in records.items():
                 for display in displays:
                     key = fallback_name_key(display)
                     if key:
                         name_index.setdefault(key, set()).add(source_id)
+                    _, provider = split_provider(display)
+                    if provider and source_id not in providers:
+                        providers[source_id] = provider
 
             candidates = {}
             for tvg_id in sorted(remaining):
-                # Exact playlist/source IDs have priority.
                 if tvg_id in records:
-                    candidates[tvg_id] = (tvg_id,)
+                    candidates[tvg_id] = [tvg_id]
                     continue
 
-                # Only accept a display-name when it identifies one source.
                 key = fallback_name_key(pl_names[tvg_id])
                 source_ids = name_index.get(key, set())
-                if len(source_ids) == 1:
-                    candidates[tvg_id] = tuple(source_ids)
+                if source_ids:
+                    candidates[tvg_id] = sorted(source_ids)
 
-            report["candidates"] = len(candidates)
+            report["name_candidates"] = len(candidates)
+
             wanted = {
                 source_id
                 for source_ids in candidates.values()
                 for source_id in source_ids
             }
-
             source_programmes = (
                 read_programmes(path, wanted) if wanted else {}
             )
@@ -584,18 +654,48 @@ def recover_from_fallbacks(
                 for source_id, items in source_programmes.items()
             }
 
-            # Prepare results before modifying shared state.
             recovered = {}
             for tvg_id, source_ids in candidates.items():
-                source_id = source_ids[0]
-                if valid_programmes.get(source_id):
-                    recovered[tvg_id] = (
-                        feed,
-                        source_id,
-                        pl_names[tvg_id].strip(),
-                        0,
-                    )
+                valid = [s for s in source_ids if valid_programmes.get(s)]
 
+                if not valid:
+                    report["no_listings"].append(tvg_id)
+                    continue
+
+                chosen = None
+                if len(valid) == 1:
+                    chosen = valid[0]
+                else:
+                    # 1) honor a provider hint from the stream URL
+                    hint = stream_provider(pl_urls.get(tvg_id, ""))
+                    if hint:
+                        hinted = [
+                            s for s in valid if providers.get(s) == hint
+                        ]
+                        if len(hinted) == 1:
+                            chosen = hinted[0]
+
+                    # 2) otherwise accept only if all schedules agree
+                    if chosen is None:
+                        signatures = {
+                            schedule_signature(valid_programmes[s])
+                            for s in valid
+                        }
+                        if len(signatures) == 1:
+                            chosen = valid[0]
+
+                if chosen is None:
+                    report["ambiguous"].append((tvg_id, valid))
+                    continue
+
+                recovered[tvg_id] = (
+                    feed,
+                    chosen,
+                    pl_names[tvg_id].strip(),
+                    0,
+                )
+
+            # Commit results only after everything succeeded.
             names[feed] = display_names
             programmes[feed] = valid_programmes
             mapping.update(recovered)
@@ -606,8 +706,10 @@ def recover_from_fallbacks(
 
             print(
                 f"  {len(records)} guide channels; "
-                f"{len(candidates)} gap candidates; "
-                f"{len(recovered)} newly covered playlist IDs",
+                f"{len(candidates)} name candidates; "
+                f"{len(report['ambiguous'])} ambiguous; "
+                f"{len(report['no_listings'])} without valid listings; "
+                f"{len(recovered)} newly covered",
                 flush=True,
             )
 
@@ -627,9 +729,11 @@ def recover_from_fallbacks(
         count = len(report["recovered"])
         total += count
         print(
-            f"{feed}: {count} newly covered; "
-            f"{report['candidates']} candidates; "
-            f"status={report['status']}",
+            f"{feed}: status={report['status']}; "
+            f"name_candidates={report['name_candidates']}; "
+            f"ambiguous={len(report['ambiguous'])}; "
+            f"no_valid_listings={len(report['no_listings'])}; "
+            f"recovered={count}",
             flush=True,
         )
         for tvg_id in report["recovered"]:
@@ -637,6 +741,19 @@ def recover_from_fallbacks(
             print(
                 f"  + {tvg_id} | {pl_names[tvg_id].strip()!r} | "
                 f"source={feed}:{source_id}",
+                flush=True,
+            )
+        for tvg_id, source_ids in report["ambiguous"]:
+            print(
+                f"  ? AMBIGUOUS {tvg_id} | "
+                f"{pl_names[tvg_id].strip()!r} | "
+                f"candidates={', '.join(source_ids)}",
+                flush=True,
+            )
+        for tvg_id in report["no_listings"]:
+            print(
+                f"  - NO LISTINGS {tvg_id} | "
+                f"{pl_names[tvg_id].strip()!r}",
                 flush=True,
             )
 
@@ -692,7 +809,11 @@ def print_closest_names(unmapped_ids, pl_names, names):
 def build(tmp):
     playlist = read_playlist()
     print(f"Playlist channels: {len(playlist)}", flush=True)
-    pl_names = {t: n for t, n, _ in playlist}
+    pl_names = {}
+    pl_urls = {}
+    for tvg_id, name, url in playlist:
+        pl_names.setdefault(tvg_id, name)
+        pl_urls.setdefault(tvg_id, url)
 
     paths = {}
     names = {}
@@ -818,9 +939,8 @@ def build(tmp):
 
     now = datetime.now(timezone.utc)
 
-    # Both unmapped IDs and mapped-but-empty IDs can be recovered.
     recover_from_fallbacks(
-        pl_names, mapping, programmes, names, tmp, now
+        pl_names, pl_urls, mapping, programmes, names, tmp, now
     )
 
     tv = ET.Element(
