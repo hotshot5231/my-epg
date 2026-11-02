@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import unicodedata
 import urllib.request
@@ -12,6 +13,9 @@ M3U_URL = "https://iptv-org.github.io/iptv/countries/us.m3u"
 OUTPUT_DIR = Path("public")
 OUTPUT_FILE = OUTPUT_DIR / "test_guide.xml"
 MIN_CHANNELS = 150  # refuse to publish if fewer channels than this match
+
+SCRAPE_SITES = ["tvtv.us", "tvpassport.com"]  # tried in this order
+SCRAPE_DAYS = 2
 
 # Guide feeds, in priority order for name matching.
 FEEDS = {
@@ -213,6 +217,45 @@ def parse_time(value):
         return None
 
 
+def run_scraper(unmatched_ids, tmp):
+    """Scrape still-unmatched channels. Returns {site: (output_path, [tvg-ids])}."""
+    base = Path("epg-scraper").resolve()
+    results = {}
+    remaining = set(unmatched_ids)
+    if not base.exists():
+        print("epg-scraper not found, skipping scrape", flush=True)
+        return results
+    for site in SCRAPE_SITES:
+        chan_file = base / "sites" / site / f"{site}.channels.xml"
+        if not chan_file.exists() or not remaining:
+            continue
+        root = ET.Element("channels")
+        ids = []
+        for ch in ET.parse(chan_file).getroot().iter("channel"):
+            xid = ch.get("xmltv_id")
+            if xid in remaining and xid not in ids:
+                root.append(deepcopy(ch))
+                ids.append(xid)
+        if not ids:
+            continue
+        cf = tmp / f"{site}.channels.xml"
+        out = tmp / f"{site}.guide.xml"
+        ET.ElementTree(root).write(cf, encoding="utf-8", xml_declaration=True)
+        print(f"Scraping {len(ids)} channels from {site}...", flush=True)
+        try:
+            subprocess.run(
+                ["npm", "run", "grab", "---", f"--channels={cf}", f"--output={out}",
+                 f"--days={SCRAPE_DAYS}", "--maxConnections=10", "--timeout=30000"],
+                cwd=base, timeout=75 * 60, check=False,
+            )
+        except Exception as error:
+            print(f"  scrape failed for {site}: {error}", flush=True)
+        if out.exists():
+            results[site] = (out, ids)
+            remaining -= set(ids)
+    return results
+
+
 def main():
     playlist = read_playlist()
     print(f"Playlist channels: {len(playlist)}", flush=True)
@@ -250,7 +293,7 @@ def main():
     guides_map = read_guides_map()
 
     # Decide a (feed, source id) for every playlist channel.
-    mapping = {}  # tvg-id -> (feed, source id, display name)
+    mapping = {}  # tvg-id -> (feed, source id, display name, shift)
     for tvg_id, name, url in playlist:
         if tvg_id in mapping:
             continue
@@ -275,6 +318,19 @@ def main():
         if match and match[0] in paths:
             shift = match[2] if len(match) > 2 else 0
             mapping[tvg_id] = (match[0], match[1], name.strip(), shift)
+
+    # Scrape per-station listings for whatever is still unmatched.
+    pl_names = {t: n for t, n, _ in playlist}
+    try:
+        scraped = run_scraper(set(pl_names) - set(mapping), tmp)
+    except Exception as error:
+        print(f"Scrape step failed, continuing without it: {error}", flush=True)
+        scraped = {}
+    for site, (out, ids) in scraped.items():
+        key = f"scrape_{site}"
+        paths[key] = out
+        for tvg_id in ids:
+            mapping[tvg_id] = (key, tvg_id, pl_names[tvg_id].strip(), 0)
 
     # Pull programmes feed by feed.
     programmes = {}
